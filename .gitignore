@@ -1,0 +1,29 @@
+# Tile working dirs (source tiles + tool outputs)
+input/
+output/
+
+# Explicit reduce/map export folders (if used outside input/)
+reduced/
+mapped/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
