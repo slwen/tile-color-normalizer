@@ -5,6 +5,11 @@ Normalize color palettes across a set of game tiles (pixel art / AI-generated ti
 1. **Reduce** — two-pass color reduction across every tile in a folder  
 2. **Map** — open a browser UI to remap those remaining colors (recolor / merge)
 
+
+<img width="640" alt="app screenshot" src="https://github.com/user-attachments/assets/c1c141fb-7013-43c6-aa3a-d499f5fd70c3" />
+
+
+
 ## Requirements
 
 ```bash
