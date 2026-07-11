@@ -714,6 +714,46 @@ MAP_HTML = r"""<!DOCTYPE html>
     width: 100%; aspect-ratio: 1; object-fit: contain; image-rendering: pixelated;
     background: repeating-conic-gradient(#2a2a2a 0% 25%, #1a1a1a 0% 50%) 50% / 12px 12px;
     border-radius: 6px; border: 1px solid var(--border);
+    cursor: zoom-in; transition: border-color 0.12s ease, transform 0.12s ease;
+  }
+  .thumb-grid img:hover {
+    border-color: var(--accent);
+    transform: scale(1.04);
+  }
+  #tile-zoom {
+    display: none;
+    position: fixed;
+    z-index: 100;
+    pointer-events: none;
+    padding: 10px 10px 28px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.55), 0 0 0 1px rgba(255,255,255,0.04);
+    max-width: min(630px, calc(100vw - 24px));
+    max-height: min(630px, calc(100vh - 24px));
+  }
+  #tile-zoom.visible { display: block; }
+  #tile-zoom img {
+    display: block;
+    width: auto;
+    height: auto;
+    max-width: min(570px, calc(100vw - 48px));
+    max-height: min(510px, calc(100vh - 72px));
+    object-fit: contain;
+    image-rendering: pixelated;
+    background: repeating-conic-gradient(#2a2a2a 0% 25%, #1a1a1a 0% 50%) 50% / 16px 16px;
+    border-radius: 6px;
+  }
+  #tile-zoom .zoom-label {
+    position: absolute;
+    left: 10px; right: 10px; bottom: 8px;
+    font-size: 0.75rem;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-align: center;
   }
   #status { font-size: 0.85rem; color: var(--muted); min-height: 1.2em; }
   #status.ok { color: var(--ok); }
@@ -737,14 +777,21 @@ MAP_HTML = r"""<!DOCTYPE html>
   <section id="colors"></section>
   <aside>
     <h2>Tiles</h2>
-    <p class="hint">Reduced tiles in this folder. After export, remapped images are written to the output directory.</p>
+    <p class="hint">Hover a tile to enlarge it. After export, remapped images are written to the output directory.</p>
     <div class="thumb-grid" id="thumbs"></div>
     <div id="status"></div>
     <p class="hint" id="out-hint"></p>
   </aside>
 </main>
+<div id="tile-zoom" aria-hidden="true">
+  <img alt=""/>
+  <div class="zoom-label"></div>
+</div>
 <script>
 const state = { colors: [], mappings: {}, baseline: {}, images: [], outputDir: "" };
+const zoomEl = document.getElementById("tile-zoom");
+const zoomImg = zoomEl.querySelector("img");
+const zoomLabel = zoomEl.querySelector(".zoom-label");
 
 function normalizeHex(v) {
   let s = (v || "").trim().replace(/^#/, "").toLowerCase();
@@ -757,6 +804,45 @@ function setStatus(msg, cls) {
   const el = document.getElementById("status");
   el.textContent = msg || "";
   el.className = cls || "";
+}
+
+function positionZoom(clientX, clientY) {
+  const pad = 16;
+  const zw = zoomEl.offsetWidth || 450;
+  const zh = zoomEl.offsetHeight || 450;
+  let left = clientX + pad;
+  let top = clientY + pad;
+  // Keep popup on-screen; prefer opposite side of cursor near edges
+  if (left + zw > window.innerWidth - pad) left = clientX - zw - pad;
+  if (top + zh > window.innerHeight - pad) top = clientY - zh - pad;
+  left = Math.max(pad, Math.min(left, window.innerWidth - zw - pad));
+  top = Math.max(pad, Math.min(top, window.innerHeight - zh - pad));
+  zoomEl.style.left = left + "px";
+  zoomEl.style.top = top + "px";
+}
+
+function showZoom(img, clientX, clientY) {
+  zoomImg.src = img.currentSrc || img.src;
+  zoomImg.alt = img.alt || "";
+  zoomLabel.textContent = img.title || img.alt || "";
+  zoomEl.classList.add("visible");
+  zoomEl.setAttribute("aria-hidden", "false");
+  // Position after becoming visible so size is measurable
+  requestAnimationFrame(() => positionZoom(clientX, clientY));
+}
+
+function hideZoom() {
+  zoomEl.classList.remove("visible");
+  zoomEl.setAttribute("aria-hidden", "true");
+  zoomImg.removeAttribute("src");
+}
+
+function bindThumbZoom(img) {
+  img.addEventListener("mouseenter", e => showZoom(img, e.clientX, e.clientY));
+  img.addEventListener("mousemove", e => {
+    if (zoomEl.classList.contains("visible")) positionZoom(e.clientX, e.clientY);
+  });
+  img.addEventListener("mouseleave", hideZoom);
 }
 
 function render() {
@@ -840,6 +926,7 @@ async function load() {
       img.src = "/tile/" + encodeURIComponent(name) + "?t=" + bust;
       img.alt = name;
       img.title = name;
+      bindThumbZoom(img);
       thumbs.appendChild(img);
     });
     render();

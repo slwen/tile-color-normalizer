@@ -100,7 +100,7 @@ In the browser you can:
 - See every remaining color across all reduced tiles (swatch, hex, usage %)
 - Pick a new color with the color picker or hex field
 - Merge colors by mapping several sources to the same target
-- Preview tile thumbnails
+- Preview tile thumbnails (hover to enlarge)
 - **Apply & export** to write remapped PNGs into `mapped/`
 
 ## How reduce works
