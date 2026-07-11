@@ -14,6 +14,8 @@ Options:
     -m / --max-colors   Max colors after reduce (default: 32)
     -i / --input-dir    Source tiles folder (default: input)
     --map-only          Skip reduce; just reopen the mapping UI
+    --reduce-only       Only reduce; do not open the map UI
+    --port / --host     Map UI bind address (default: 127.0.0.1:8765)
 """
 
 from __future__ import annotations
@@ -21,7 +23,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
+import tempfile
 import threading
 import webbrowser
 from collections import Counter
@@ -165,7 +169,6 @@ def snap_image_to_palette(arr: np.ndarray, palette_rgb: list[tuple[int, int, int
     visible_rgb = flat_rgb[visible_idx].astype(np.int32)
     pal_arr = np.array(palette_rgb, dtype=np.int32)
     # Chunk if huge to avoid massive memory on (N, K, 3)
-    k = len(palette_rgb)
     nearest = np.empty(len(visible_idx), dtype=np.int32)
     chunk = 200_000
     for start in range(0, len(visible_idx), chunk):
@@ -331,35 +334,44 @@ def kmeans_palette(
             centers[c] = pts[rng.choice(n, p=scores / total)]
 
     for _ in range(max_iter):
-        # Assign
-        # dists: (n, k)
         dists = np.sum((pts[:, None, :] - centers[None, :, :]) ** 2, axis=2)
         labels = np.argmin(dists, axis=1)
+        residuals = dists[np.arange(n), labels].copy()
         new_centers = centers.copy()
+        reseeded: set[int] = set()
+
         for ci in range(k):
             m = labels == ci
-            if not np.any(m):
-                # re-seed empty cluster toward worst-fit point
-                worst = int(np.argmax(closest))
-                new_centers[ci] = pts[worst]
+            if np.any(m):
+                ww = w[m]
+                s = ww.sum()
+                if s <= 0:
+                    new_centers[ci] = pts[m].mean(axis=0)
+                else:
+                    new_centers[ci] = (pts[m] * ww[:, None]).sum(axis=0) / s
                 continue
-            ww = w[m]
-            s = ww.sum()
-            if s <= 0:
-                new_centers[ci] = pts[m].mean(axis=0)
-            else:
-                new_centers[ci] = (pts[m] * ww[:, None]).sum(axis=0) / s
+
+            # Empty cluster: reseed to a distinct high-residual point
+            order = np.argsort(-residuals)
+            for idx in order:
+                ii = int(idx)
+                if ii in reseeded or residuals[ii] < 0:
+                    continue
+                new_centers[ci] = pts[ii].copy()
+                reseeded.add(ii)
+                residuals[ii] = -1.0
+                break
+
         if np.allclose(new_centers, centers, atol=0.25):
             centers = new_centers
             break
         centers = new_centers
-        closest = np.min(np.sum((pts[:, None, :] - centers[None, :, :]) ** 2, axis=2), axis=1)
 
     out = []
     for c in centers:
         rgb = tuple(int(max(0, min(255, round(v)))) for v in c)
         out.append(rgb)  # type: ignore[arg-type]
-    # Deduplicate after rounding
+    # Deduplicate after rounding (near-identical centers can still collapse)
     seen = set()
     unique = []
     for c in out:
@@ -492,6 +504,21 @@ def create_palette_preview(palette: list[dict], output_path: Path, swatch_size: 
 # Step 1: REDUCE
 # ---------------------------------------------------------------------------
 
+def check_stem_collisions(image_files: list[Path]) -> str | None:
+    """Return an error message if two sources would write the same stem.png."""
+    by_stem: dict[str, list[str]] = {}
+    for p in image_files:
+        by_stem.setdefault(p.stem, []).append(p.name)
+    collisions = {s: names for s, names in by_stem.items() if len(names) > 1}
+    if not collisions:
+        return None
+    parts = [f"{s!r} ← {names}" for s, names in sorted(collisions.items())]
+    return (
+        "Export stem collision: multiple sources share the same filename stem "
+        "(would overwrite as .png):\n  " + "\n  ".join(parts)
+    )
+
+
 def run_reduce(input_dir: Path, output_dir: Path, max_colors: int) -> int:
     """
     Two-pass color reduce:
@@ -515,13 +542,17 @@ def run_reduce(input_dir: Path, output_dir: Path, max_colors: int) -> int:
         print("No supported image files found.")
         return 1
 
+    collision = check_stem_collisions(image_files)
+    if collision:
+        print(f"ERROR: {collision}")
+        return 1
+
     print(f"Found {len(image_files)} image(s).")
 
-    # --- Pass 1: per-image local reduction ---
+    # --- Pass 1: per-image local palettes only (no full images kept in RAM) ---
     print(f"\nPass 1/2: reduce each image to ≤{max_colors} colors (stratified k-means)...")
-    local_images: list[np.ndarray] = []
     per_image_colors: list[list[tuple[int, int, int]]] = []
-    names: list[str] = []
+    ok_paths: list[Path] = []
     total_unique_before = 0
 
     for i, img_path in enumerate(image_files, 1):
@@ -529,22 +560,21 @@ def run_reduce(input_dir: Path, output_dir: Path, max_colors: int) -> int:
             arr = load_rgba(img_path)
             before = len(unique_colors_in_arr(arr))
             total_unique_before += before
-            quantized, local_pal = quantize_image_local(arr, max_colors)
-            local_images.append(quantized)
+            _quantized, local_pal = quantize_image_local(arr, max_colors)
+            del arr, _quantized
             per_image_colors.append(local_pal)
-            names.append(img_path.name)
+            ok_paths.append(img_path)
             if i % 10 == 0 or i == len(image_files):
                 print(f"  [{i}/{len(image_files)}] {img_path.name}: {before} → {len(local_pal)} colors")
         except Exception as e:
             print(f"  [Error] {img_path.name}: {e}")
 
-    if not local_images:
+    if not ok_paths:
         print("No images could be processed.")
         return 1
 
-    # --- Pass 2: representative shared palette ---
+    # --- Pass 2: representative shared palette, then snap originals ---
     print(f"\nPass 2/2: build shared palette of {max_colors} representative colors...")
-    # Pool of local colors (with duplicates across tiles) before clustering
     pooled = [c for colors in per_image_colors for c in colors]
     print(f"  Local palette colors pooled: {len(pooled)} ({len(set(pooled))} unique)")
     global_palette = build_global_palette(per_image_colors, max_colors)
@@ -555,16 +585,17 @@ def run_reduce(input_dir: Path, output_dir: Path, max_colors: int) -> int:
 
     print(f"\nWriting normalized tiles → {output_dir}")
     processed = 0
-    for name, local_arr in zip(names, local_images):
+    for i, img_path in enumerate(ok_paths, 1):
         try:
-            final = snap_image_to_palette(local_arr, global_palette)
-            out_path = output_dir / (Path(name).stem + ".png")
+            arr = load_rgba(img_path)
+            final = snap_image_to_palette(arr, global_palette)
+            out_path = output_dir / (img_path.stem + ".png")
             Image.fromarray(final, "RGBA").save(out_path, "PNG")
             processed += 1
-            if processed % 10 == 0 or processed == len(local_images):
-                print(f"  [{processed}/{len(local_images)}] {name}")
+            if i % 10 == 0 or i == len(ok_paths):
+                print(f"  [{processed}/{len(ok_paths)}] {img_path.name}")
         except Exception as e:
-            print(f"  [Error] {name}: {e}")
+            print(f"  [Error] {img_path.name}: {e}")
 
     reduced_files = get_image_files(output_dir)
     post_counter, post_visible = collect_color_counter(reduced_files)
@@ -713,7 +744,7 @@ MAP_HTML = r"""<!DOCTYPE html>
   </aside>
 </main>
 <script>
-const state = { colors: [], mappings: {}, images: [], outputDir: "" };
+const state = { colors: [], mappings: {}, baseline: {}, images: [], outputDir: "" };
 
 function normalizeHex(v) {
   let s = (v || "").trim().replace(/^#/, "").toLowerCase();
@@ -784,32 +815,53 @@ function render() {
 }
 
 async function load() {
-  const res = await fetch("/api/state");
-  const data = await res.json();
-  state.colors = data.colors;
-  state.images = data.images;
-  state.outputDir = data.output_dir;
-  state.mappings = {};
-  data.colors.forEach(c => { state.mappings[c.hex] = c.new_hex || c.hex; });
-  document.getElementById("meta").textContent =
-    `${data.colors.length} colors · ${data.images.length} tiles · ${data.total_visible.toLocaleString()} visible px`;
-  document.getElementById("out-hint").textContent = "Export → " + data.output_dir;
-  const thumbs = document.getElementById("thumbs");
-  thumbs.innerHTML = data.images.map(name =>
-    `<img src="/tile/${encodeURIComponent(name)}?t=${Date.now()}" alt="${name}" title="${name}"/>`
-  ).join("");
-  render();
+  try {
+    const res = await fetch("/api/state");
+    if (!res.ok) throw new Error("Failed to load state (" + res.status + ")");
+    const data = await res.json();
+    state.colors = data.colors || [];
+    state.images = data.images || [];
+    state.outputDir = data.output_dir || "";
+    state.mappings = {};
+    state.baseline = {};
+    state.colors.forEach(c => {
+      const target = c.new_hex || c.hex;
+      state.mappings[c.hex] = target;
+      state.baseline[c.hex] = target;
+    });
+    document.getElementById("meta").textContent =
+      `${state.colors.length} colors · ${state.images.length} tiles · ${(data.total_visible || 0).toLocaleString()} visible px`;
+    document.getElementById("out-hint").textContent = "Export → " + state.outputDir;
+    const thumbs = document.getElementById("thumbs");
+    thumbs.replaceChildren();
+    const bust = Date.now();
+    state.images.forEach(name => {
+      const img = document.createElement("img");
+      img.src = "/tile/" + encodeURIComponent(name) + "?t=" + bust;
+      img.alt = name;
+      img.title = name;
+      thumbs.appendChild(img);
+    });
+    render();
+    setStatus("");
+  } catch (err) {
+    setStatus(String(err.message || err), "err");
+  }
 }
 
 document.getElementById("btn-reset").onclick = () => {
-  state.colors.forEach(c => { state.mappings[c.hex] = c.hex; });
+  // Restore targets loaded at session start (includes palette.json new_hex)
+  state.colors.forEach(c => {
+    state.mappings[c.hex] = state.baseline[c.hex] || c.hex;
+  });
   render();
-  setStatus("Mappings reset to original colors.");
+  setStatus("Mappings reset to loaded baselines.");
 };
 document.getElementById("btn-identity").onclick = () => {
+  // No remap: each color maps to itself
   state.colors.forEach(c => { state.mappings[c.hex] = c.hex; });
   render();
-  setStatus("Identity mapping.");
+  setStatus("Identity mapping (no color changes).");
 };
 document.getElementById("btn-apply").onclick = async () => {
   setStatus("Applying…");
@@ -822,10 +874,14 @@ document.getElementById("btn-apply").onclick = async () => {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ mappings }),
     });
-    const data = await res.json();
+    let data = {};
+    try { data = await res.json(); } catch (_) {}
     if (!res.ok) throw new Error(data.error || "Apply failed");
     setStatus(`Exported ${data.processed} image(s) → ${data.output_dir}`, "ok");
-    // refresh thumbs from source (unchanged); mention success
+    // Update baseline to last successful export so Reset returns here
+    state.colors.forEach(c => {
+      state.baseline[c.hex] = state.mappings[c.hex] || c.hex;
+    });
   } catch (err) {
     setStatus(String(err.message || err), "err");
   } finally {
@@ -908,40 +964,70 @@ def build_map_app(input_dir: Path, output_dir: Path):
                 return jsonify({"error": str(e)}), 400
             old_to_new[old] = new
 
-        output_dir.mkdir(parents=True, exist_ok=True)
         files = get_image_files(input_dir)
-        processed = 0
-        for img_path in files:
-            try:
+        if not files:
+            return jsonify({"error": "No images to process"}), 400
+        collision = check_stem_collisions(files)
+        if collision:
+            return jsonify({"error": collision}), 400
+
+        # Write everything to a temp dir, then swap into place on full success
+        output_dir.parent.mkdir(parents=True, exist_ok=True)
+        tmp = Path(tempfile.mkdtemp(prefix=".mapped_tmp_", dir=str(output_dir.parent)))
+        try:
+            processed = 0
+            for img_path in files:
                 arr = load_rgba(img_path)
                 remapped = apply_color_map(arr, old_to_new)
-                out_path = output_dir / (img_path.stem + ".png")
+                out_path = tmp / (img_path.stem + ".png")
                 Image.fromarray(remapped, "RGBA").save(out_path, "PNG")
                 processed += 1
-            except Exception as e:
-                return jsonify({"error": f"{img_path.name}: {e}"}), 500
 
-        # Persist mapping into palette.json on the input (reduced) folder
-        counter, total_visible = collect_color_counter(files)
-        palette = create_palette_entries(counter, None, total_visible)
-        for e in palette:
-            key = tuple(e["rgb"])
-            if key in old_to_new:
-                e["new_hex"] = rgb_to_hex(old_to_new[key])
-        save_palette_json(
-            palette,
-            len(counter),
-            total_visible,
-            len(palette),
-            input_dir / "palette.json",
-        )
+            # Palette of final mapped colors (from temp outputs)
+            out_files = get_image_files(tmp)
+            post_c, post_v = collect_color_counter(out_files)
+            final_pal = create_palette_entries(post_c, None, post_v)
+            save_palette_json(final_pal, len(post_c), post_v, len(final_pal), tmp / "palette.json")
+            create_palette_preview(final_pal, tmp / "palette_preview.png")
 
-        # Also write palette of final mapped colors into output
-        out_files = get_image_files(output_dir)
-        post_c, post_v = collect_color_counter(out_files)
-        final_pal = create_palette_entries(post_c, None, post_v)
-        save_palette_json(final_pal, len(post_c), post_v, len(final_pal), output_dir / "palette.json")
-        create_palette_preview(final_pal, output_dir / "palette_preview.png")
+            # Persist mapping into palette.json on the reduced input folder
+            counter, total_visible = collect_color_counter(files)
+            palette = create_palette_entries(counter, None, total_visible)
+            for e in palette:
+                key = tuple(e["rgb"])
+                if key in old_to_new:
+                    e["new_hex"] = rgb_to_hex(old_to_new[key])
+            save_palette_json(
+                palette,
+                len(counter),
+                total_visible,
+                len(palette),
+                input_dir / "palette.json",
+            )
+
+            # Publish by directory swap so a mid-move failure cannot leave a
+            # half-updated mapped/ folder.
+            backup = None
+            if output_dir.exists():
+                backup = output_dir.with_name(output_dir.name + ".bak_swap")
+                if backup.exists():
+                    shutil.rmtree(backup)
+                output_dir.replace(backup)
+            try:
+                tmp.replace(output_dir)
+            except Exception:
+                # Roll back previous output if swap failed
+                if backup is not None and backup.exists() and not output_dir.exists():
+                    backup.replace(output_dir)
+                raise
+            if backup is not None and backup.exists():
+                shutil.rmtree(backup, ignore_errors=True)
+            tmp = None  # successfully moved; don't rmtree in finally
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+        finally:
+            if tmp is not None and tmp.exists():
+                shutil.rmtree(tmp, ignore_errors=True)
 
         return jsonify(
             {
@@ -954,16 +1040,35 @@ def build_map_app(input_dir: Path, output_dir: Path):
     return app
 
 
+def _is_loopback_host(host: str) -> bool:
+    h = (host or "").strip().lower()
+    return h in {"127.0.0.1", "localhost", "::1", "0"}
+
+
 def run_map(
     input_dir: Path,
     output_dir: Path,
     host: str = "127.0.0.1",
     port: int = 8765,
     open_browser: bool = True,
+    allow_remote: bool = False,
 ) -> int:
     if not input_dir.exists():
         print(f"ERROR: Input directory not found: {input_dir}")
         return 1
+
+    if not _is_loopback_host(host) and not allow_remote:
+        print(
+            f"ERROR: Refusing to bind map UI to non-loopback host {host!r}.\n"
+            "  The map API has no authentication and can write files.\n"
+            "  Re-run with --allow-remote if you really intend this."
+        )
+        return 1
+    if not _is_loopback_host(host) and allow_remote:
+        print(
+            f"WARNING: Binding map UI to {host!r} with no authentication. "
+            "Anyone who can reach it can export remapped tiles."
+        )
 
     files = get_image_files(input_dir)
     if not files:
@@ -986,7 +1091,12 @@ def run_map(
     if open_browser:
         threading.Timer(0.6, lambda: webbrowser.open(url)).start()
 
-    app.run(host=host, port=port, debug=False, use_reloader=False)
+    try:
+        app.run(host=host, port=port, debug=False, use_reloader=False)
+    except OSError as e:
+        print(f"ERROR: Could not start map UI on {host}:{port}: {e}")
+        print(f"  Try a different port, e.g.  python tile_color_normalizer.py --map-only --port {port + 1}")
+        return 1
     return 0
 
 
@@ -1019,14 +1129,36 @@ def main():
         help="Skip reduce; only open the mapping UI on input/reduced",
     )
     parser.add_argument(
+        "--reduce-only",
+        action="store_true",
+        help="Only run color reduce; do not open the map UI",
+    )
+    parser.add_argument(
         "--no-browser",
         action="store_true",
         help="Do not auto-open a browser for the map UI",
     )
-    parser.add_argument("--host", default="127.0.0.1", help=argparse.SUPPRESS)
-    parser.add_argument("--port", type=int, default=8765, help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Map UI bind host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="Map UI port (default: 8765)",
+    )
+    parser.add_argument(
+        "--allow-remote",
+        action="store_true",
+        help="Allow binding the map UI to a non-loopback host (no auth)",
+    )
 
     args = parser.parse_args()
+    if args.map_only and args.reduce_only:
+        parser.error("Use only one of --map-only or --reduce-only")
+
     source = Path(args.input_dir)
     reduced = source / "reduced"
     mapped = source / "mapped"
@@ -1036,12 +1168,16 @@ def main():
         if rc != 0:
             sys.exit(rc)
 
+    if args.reduce_only:
+        return
+
     rc = run_map(
         reduced,
         mapped,
         host=args.host,
         port=args.port,
         open_browser=not args.no_browser,
+        allow_remote=args.allow_remote,
     )
     if rc != 0:
         sys.exit(rc)

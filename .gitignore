@@ -5,6 +5,8 @@ output/
 # Explicit reduce/map export folders (if used outside input/)
 reduced/
 mapped/
+*.bak_swap
+.mapped_tmp_*/
 
 # Python
 __pycache__/

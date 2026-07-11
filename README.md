@@ -8,7 +8,7 @@ Normalize color palettes across a set of game tiles (pixel art / AI-generated ti
 ## Requirements
 
 ```bash
-pip install numpy Pillow flask
+pip install -r requirements.txt
 ```
 
 ## Quick start
@@ -44,7 +44,11 @@ python tile_color_normalizer.py
 | `-i`, `--input-dir` | Folder with source tiles | `input` |
 | `-m`, `--max-colors` | Max colors kept after reduce | `32` |
 | `--map-only` | Skip reduce; only open the mapping UI on `<input>/reduced` | off |
+| `--reduce-only` | Only reduce colors; do not open the map UI | off |
 | `--no-browser` | Don’t auto-open a browser | off |
+| `--port` | Map UI port | `8765` |
+| `--host` | Map UI bind host | `127.0.0.1` |
+| `--allow-remote` | Allow non-loopback `--host` (no auth — careful) | off |
 | `-h`, `--help` | Show help | — |
 
 ### Examples
@@ -59,11 +63,17 @@ python tile_color_normalizer.py -m 16
 # Different source folder
 python tile_color_normalizer.py -i ./tiles
 
+# Headless reduce only (no browser UI)
+python tile_color_normalizer.py --reduce-only -m 16
+
 # Reopen the mapping UI without re-running reduce
 python tile_color_normalizer.py --map-only
 
 # Run UI without opening a browser (open the URL yourself)
 python tile_color_normalizer.py --map-only --no-browser
+
+# Use a different port if 8765 is busy
+python tile_color_normalizer.py --map-only --port 8766
 ```
 
 ## Output layout
